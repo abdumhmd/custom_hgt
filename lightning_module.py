@@ -1,16 +1,20 @@
 """
-LightningModule + LightningDataModules for the Party fraud classifier.
+LightningModule + LightningDataModules for the two architectures in
+`model.py`, generalized across datasets (see `datasets.py`): binary fraud
+classification (AUROC/AP) on TigerGraph/synthetic/IEEE-fraud, or multiclass
+classification (accuracy) on OGBN-MAG. Nothing here is schema- or
+dataset-specific -- `target_node_type`, `num_classes`, and `task` all come
+from the caller.
 
-`Mule_Account_Detection` is small enough (~40k vertices, ~130k edges, or
-~130k vertices once transfers are reified) that full-graph training fits
-comfortably. `NeighborLoader` remains the default anyway: it is the path that
-survives a larger graph, and with only 49 positives the mini-batch loop gives
-far more gradient steps per epoch than the single step full-graph training
-provides.
+Two datamodules, interchangeable from the LightningModule's side -- it only
+assumes a batch exposes `x_dict`, `edge_index_dict`, optional
+`edge_attr_dict`, and a way to identify seed nodes and labels:
 
-The two datamodules are interchangeable from the LightningModule's side --
-it only assumes a batch exposes `x_dict`, `edge_index_dict`, optional
-`edge_attr`, and a way to identify seed nodes and labels.
+- `FullGraphDataModule`: one gradient step per epoch, no sampler. Fine for
+  graphs that fit in memory whole (synthetic, IEEE fraud).
+- `NeighborDataModule`: PyG `NeighborLoader` mini-batching, uniform fan-out
+  per hop. Needed once the graph doesn't fit whole (OGBN-MAG), or to get more
+  gradient steps per epoch out of a small positive class (TigerGraph).
 """
 
 from typing import Dict, Optional
@@ -21,7 +25,6 @@ import torch.nn.functional as F
 import torchmetrics
 from torch_geometric.loader import NeighborLoader
 
-import schema
 from model import build_model
 
 
@@ -55,26 +58,32 @@ class FullGraphBatch:
         return self
 
 
-class FraudHGTLightningModule(pl.LightningModule):
+class GNNLightningModule(pl.LightningModule):
     def __init__(
         self,
         node_feat_dims: Dict[str, int],
         metadata,
+        target_node_type: str,
+        num_classes: int,
+        task: str = "binary",  # "binary" -> AUROC/AP, "multiclass" -> accuracy
         hidden_channels: int = 64,
         num_heads: int = 4,
         num_layers: int = 3,
+        dropout: float = 0.2,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
-        target_node_type: str = schema.TARGET_TYPE,
-        class_weights: torch.Tensor = None,
+        class_weights: Optional[torch.Tensor] = None,
         conv: str = "hgt",
         edge_feat_dims: Optional[Dict] = None,
     ):
         super().__init__()
+        if task not in ("binary", "multiclass"):
+            raise ValueError(f"task must be 'binary' or 'multiclass', got {task!r}")
         # avoid saving huge metadata objects verbatim in the checkpoint hparams
         self.save_hyperparameters(ignore=["metadata", "class_weights", "edge_feat_dims"])
         self.metadata = metadata
         self.target_node_type = target_node_type
+        self.task = task
 
         self.model = build_model(
             conv=conv,
@@ -82,39 +91,42 @@ class FraudHGTLightningModule(pl.LightningModule):
             edge_feat_dims=edge_feat_dims,
             metadata=metadata,
             hidden_channels=hidden_channels,
-            out_channels=2,
+            out_channels=num_classes,
             num_heads=num_heads,
             num_layers=num_layers,
             target_node_type=target_node_type,
+            dropout=dropout,
         )
 
         self.register_buffer(
             "class_weights",
-            class_weights if class_weights is not None else torch.tensor([1.0, 1.0]),
+            class_weights if class_weights is not None else torch.ones(num_classes),
         )
 
-        # metrics: AUROC / AP matter far more than accuracy for fraud
-        # (heavy class imbalance -> accuracy is close to meaningless)
-        self.train_auroc = torchmetrics.AUROC(task="binary")
-        self.val_auroc = torchmetrics.AUROC(task="binary")
-        self.val_ap = torchmetrics.AveragePrecision(task="binary")
-        self.test_auroc = torchmetrics.AUROC(task="binary")
-        self.test_ap = torchmetrics.AveragePrecision(task="binary")
+        if task == "binary":
+            # AUROC/AP matter far more than accuracy under class imbalance.
+            self.train_metric = torchmetrics.AUROC(task="binary")
+            self.val_metric = torchmetrics.AUROC(task="binary")
+            self.val_ap = torchmetrics.AveragePrecision(task="binary")
+            self.test_metric = torchmetrics.AUROC(task="binary")
+            self.test_ap = torchmetrics.AveragePrecision(task="binary")
+            self.monitor = "val_auroc"
+        else:
+            self.train_metric = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+            self.val_metric = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+            self.test_metric = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+            self.monitor = "val_acc"
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict=None):
         return self.model(x_dict, edge_index_dict, edge_attr_dict)
 
     def _shared_step(self, batch, stage: str):
-        # Only the un-reified Transfer relation carries edge attributes, and
-        # only HeteroEdgeGNN reads them; HGT ignores the argument.
-        #
         # Note: `hasattr(batch, "edge_attr_dict")` is not usable to tell the two
         # batch types apart. HeteroData.__getattr__ intercepts any `*_dict`
         # access and raises KeyError when no edge has that attribute, and
         # hasattr only swallows AttributeError. Branch on the batch type first.
         if isinstance(batch, FullGraphBatch):
-            edge_attr_dict = batch.edge_attr_dict
-            out = self(batch.x_dict, batch.edge_index_dict, edge_attr_dict)
+            out = self(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)
             # node order is untouched, so index the seed nodes directly
             seed_out = out[batch.seed_idx]
             seed_y = batch.seed_y
@@ -126,39 +138,49 @@ class FraudHGTLightningModule(pl.LightningModule):
             }
             out = self(batch.x_dict, batch.edge_index_dict, edge_attr_dict)
             # NeighborLoader mini-batch: seed nodes come first, so slice to
-            # `batch_size` to compute loss only on the seed Parties, not the
+            # `batch_size` to compute loss only on the seed nodes, not the
             # neighbours pulled in for message passing.
             size = batch[self.target_node_type].batch_size
             seed_out = out[:size]
             seed_y = batch[self.target_node_type].y[:size]
 
         loss = F.cross_entropy(seed_out, seed_y, weight=self.class_weights)
-        probs = F.softmax(seed_out, dim=-1)[:, 1]
-
         self.log(f"{stage}_loss", loss, prog_bar=True, batch_size=seed_y.size(0))
-        return loss, probs, seed_y
+        return loss, seed_out, seed_y
 
     def training_step(self, batch, batch_idx):
-        loss, probs, y = self._shared_step(batch, "train")
-        self.train_auroc.update(probs, y)
-        self.log("train_auroc", self.train_auroc, prog_bar=True, on_step=False, on_epoch=True)
+        loss, out, y = self._shared_step(batch, "train")
+        self._update_metric(self.train_metric, out, y)
+        self.log(f"train_{self._metric_name}", self.train_metric, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, probs, y = self._shared_step(batch, "val")
-        self.val_auroc.update(probs, y)
-        self.val_ap.update(probs, y)
-        self.log("val_auroc", self.val_auroc, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("val_ap", self.val_ap, prog_bar=True, on_step=False, on_epoch=True)
+        loss, out, y = self._shared_step(batch, "val")
+        self._update_metric(self.val_metric, out, y)
+        self.log(f"val_{self._metric_name}", self.val_metric, prog_bar=True, on_step=False, on_epoch=True)
+        if self.task == "binary":
+            self.val_ap.update(F.softmax(out, dim=-1)[:, 1], y)
+            self.log("val_ap", self.val_ap, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def test_step(self, batch, batch_idx):
-        loss, probs, y = self._shared_step(batch, "test")
-        self.test_auroc.update(probs, y)
-        self.test_ap.update(probs, y)
-        self.log("test_auroc", self.test_auroc, on_step=False, on_epoch=True)
-        self.log("test_ap", self.test_ap, on_step=False, on_epoch=True)
+        loss, out, y = self._shared_step(batch, "test")
+        self._update_metric(self.test_metric, out, y)
+        self.log(f"test_{self._metric_name}", self.test_metric, on_step=False, on_epoch=True)
+        if self.task == "binary":
+            self.test_ap.update(F.softmax(out, dim=-1)[:, 1], y)
+            self.log("test_ap", self.test_ap, on_step=False, on_epoch=True)
         return loss
+
+    @property
+    def _metric_name(self) -> str:
+        return "auroc" if self.task == "binary" else "acc"
+
+    def _update_metric(self, metric, out, y):
+        if self.task == "binary":
+            metric.update(F.softmax(out, dim=-1)[:, 1], y)
+        else:
+            metric.update(out.argmax(dim=-1), y)
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(
@@ -167,12 +189,12 @@ class FraudHGTLightningModule(pl.LightningModule):
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", patience=5)
         return {
             "optimizer": opt,
-            "lr_scheduler": {"scheduler": sched, "monitor": "val_auroc"},
+            "lr_scheduler": {"scheduler": sched, "monitor": self.monitor},
         }
 
 
-class FraudHeteroDataModule(pl.LightningDataModule):
-    """Wraps a single in-memory HeteroData object with NeighborLoader.
+class NeighborDataModule(pl.LightningDataModule):
+    """PyG `NeighborLoader` mini-batching, uniform fan-out per hop.
 
     This is the class to swap out if the graph outgrows one machine: `setup()`
     would open a partitioned graph store and the `*_dataloader()` methods
@@ -183,26 +205,16 @@ class FraudHeteroDataModule(pl.LightningDataModule):
     def __init__(
         self,
         data,
-        target_node_type: str = schema.TARGET_TYPE,
-        num_neighbors=None,
-        num_hops: int = 3,
-        batch_size: int = 64,
+        target_node_type: str,
+        num_neighbors: int = 10,
+        num_hops: int = 2,
+        batch_size: int = 512,
         num_workers: int = 0,
     ):
         super().__init__()
         self.data = data
         self.target_node_type = target_node_type
-        # Per-relation fan-out, keyed off the relations the graph actually has
-        # rather than the schema's declared ones -- reification swaps Transfer
-        # for Send/Receive, and NeighborLoader raises if any relation present in
-        # the data is missing an entry. This graph's hubs are mild (~5 Parties
-        # per shared IP or Device), so they are capped modestly rather than
-        # hard: at that width the sharing IS the fraud signal.
-        self.num_neighbors = (
-            num_neighbors
-            if num_neighbors is not None
-            else schema.build_fanout(num_hops, edge_types=data.edge_types)
-        )
+        self.num_neighbors = {et: [num_neighbors] * num_hops for et in data.edge_types}
         self.batch_size = batch_size
         self.num_workers = num_workers
 
@@ -228,14 +240,14 @@ class FraudHeteroDataModule(pl.LightningDataModule):
         return self._loader("test_mask", shuffle=False)
 
 
-class FraudFullGraphDataModule(pl.LightningDataModule):
+class FullGraphDataModule(pl.LightningDataModule):
     """Full-batch (no neighbor sampling) datamodule.
 
-    Fits this graph easily, and needs no pyg-lib. The tradeoff is one gradient
-    step per epoch, which trains much more slowly than the sampled path.
+    The tradeoff for graphs that fit this way is one gradient step per
+    epoch, which trains much more slowly than the sampled path.
     """
 
-    def __init__(self, data, target_node_type: str = schema.TARGET_TYPE):
+    def __init__(self, data, target_node_type: str):
         super().__init__()
         self.data = data
         self.target_node_type = target_node_type

@@ -89,10 +89,13 @@ structure itself.
 | `features.py` | Attribute → tensor encoding, structural degree features, constant pruning, stratified splitting, `leakage_audit`. |
 | `data.py` | `build_hetero_data` (shared assembly), transfer reification, and a synthetic generator on the same schema. |
 | `tg_loader.py` | Live TigerGraph pull and on-disk export loader. |
+| `build_ieee_fraud_graph.py` | Builds a heterogeneous, edge-attributed graph from the Kaggle IEEE-CIS fraud CSVs. |
+| `datasets.py` | Dataset registry (`synthetic`, `tigergraph`, `ieee_fraud`, `ogbn_mag`) — turns a `--dataset` name into a ready-to-train `HeteroData` plus task metadata (target type, class count, binary/multiclass, default sampling). Add a dataset here; nothing downstream needs to change. |
 | `model.py` | `HGT` (HGTConv) and `HeteroEdgeGNN` (HeteroConv + TransformerConv, reads edge features). |
-| `lightning_module.py` | Train/val/test steps, AUROC/AP, class weighting, NeighborLoader + full-graph datamodules. |
-| `train.py` | CLI entrypoint. |
-| `sweep.py` | Multi-seed evaluation — the only honest way to read a metric here. |
+| `lightning_module.py` | `GNNLightningModule` (train/val/test steps, AUROC/AP or accuracy depending on task, class weighting) and `NeighborDataModule` / `FullGraphDataModule`. |
+| `train.py` | Train one (dataset, conv) pair, then evaluate the best checkpoint. |
+| `hparam_search.py` | Optuna search over hidden size / heads / layers / dropout / lr / weight decay, then a final retrain + eval of the best trial. |
+| `eval.py` | Standalone: load a saved checkpoint and report test metrics. Also the shared `evaluate()`/`make_datamodule()` that `train.py` and `hparam_search.py` call in-process. |
 | `diagnose.py` | Pre-training check: does the graph contain exploitable fraud structure at all? Run this before blaming a model. |
 | `preflight.py` | Read-only schema/connection/label check against a live instance. |
 | `test_schema.py` | 18 conformance tests, no database required. |
@@ -100,18 +103,36 @@ structure itself.
 ## Install and run
 
 ```bash
-pip install torch torch_geometric pytorch_lightning torchmetrics pandas pyTigerGraph
+pip install torch torch_geometric pytorch_lightning torchmetrics pandas pyTigerGraph optuna
 pip install pyg-lib -f https://data.pyg.org/whl/torch-<ver>+cpu.html   # for NeighborLoader
 ```
 
 ```bash
-python test_schema.py                          # 18 tests, no DB
-python preflight.py                            # check a live instance
-python train.py                                # synthetic
-python train.py --source tigergraph            # live pull
-python diagnose.py --source tigergraph         # is there signal to learn?
-python sweep.py --source tigergraph --seeds 8  # multi-seed evaluation
+python test_schema.py                                       # 18 tests, no DB
+python preflight.py                                         # check a live instance
+python diagnose.py --source tigergraph                      # is there signal to learn?
+
+python train.py --dataset synthetic                         # train + eval, synthetic data
+python train.py --dataset tigergraph                        # train + eval, live pull
+python train.py --dataset ieee_fraud --conv transformer     # edge features off the edge
+python train.py --dataset ogbn_mag --conv hgt                # multiclass, sampled
+
+python hparam_search.py --dataset ieee_fraud --conv hgt --trials 30   # Optuna search + final retrain
+
+python eval.py --dataset ieee_fraud --ckpt lightning_logs/version_0/checkpoints/best.ckpt
 ```
+
+`--dataset` selects from `datasets.py`'s registry; `--conv {hgt,transformer}` selects the
+architecture in `model.py`. Run `python train.py --help` / `python hparam_search.py --help`
+for the full flag list (hidden size, heads, layers, sampling, TigerGraph/synthetic-specific
+flags like `--split` and `--no-reify`, etc).
+
+**Multi-seed evaluation was dropped in this refactor.** With 49 positives in the
+TigerGraph/synthetic graph, a single seed's ~7 test positives are not enough to trust one
+run's AUROC — the old `sweep.py` re-split across seeds and reported the spread for exactly
+that reason. `train.py --dataset synthetic --seed N` still lets you do this by hand across a
+few seeds; there's no `--seeds` loop built back in yet. Ask if you want that capability
+restored as a flag on `train.py`.
 
 Credentials come from the environment, never code. For a local Community
 Edition instance, the web-UI login is the GSQL login, and REST++ auth is off by
