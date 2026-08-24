@@ -96,6 +96,7 @@ def train_one(conv, data, device, args):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cache", default=".cache/ieee_fraud_graph.pt")
+    p.add_argument("--conv", choices=["hgt", "transformer", "both"], default="both")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--hidden-channels", type=int, default=64)
     p.add_argument("--num-heads", type=int, default=4)
@@ -112,8 +113,9 @@ def main():
     base_rate = data["transaction"].y[data["transaction"].test_mask].float().mean().item()
     print(f"test fraud base rate: {base_rate:.4f}")
 
+    convs = ["hgt", "transformer"] if args.conv == "both" else [args.conv]
     results = []
-    for conv in ["hgt", "transformer"]:
+    for conv in convs:
         print(f"\n=== {conv} ===")
         results.append(train_one(conv, data, device, args))
 
