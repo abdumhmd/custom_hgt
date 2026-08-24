@@ -103,7 +103,7 @@ structure itself.
 ## Install and run
 
 ```bash
-pip install torch torch_geometric pytorch_lightning torchmetrics pandas pyTigerGraph optuna
+pip install torch torch_geometric pytorch_lightning torchmetrics pandas pyTigerGraph optuna ogb kaggle
 pip install pyg-lib -f https://data.pyg.org/whl/torch-<ver>+cpu.html   # for NeighborLoader
 ```
 
@@ -126,6 +126,38 @@ python eval.py --dataset ieee_fraud --ckpt lightning_logs/version_0/checkpoints/
 architecture in `model.py`. Run `python train.py --help` / `python hparam_search.py --help`
 for the full flag list (hidden size, heads, layers, sampling, TigerGraph/synthetic-specific
 flags like `--split` and `--no-reify`, etc).
+
+### Getting the data
+
+`synthetic` needs nothing — it's generated on the fly. The other three:
+
+**`tigergraph`** — a live instance; see the connection section below.
+
+**`ogbn_mag`** — nothing to do manually. `datasets.py` calls PyG's `OGB_MAG(root="data/ogbn_mag", ...)`
+on first use, which downloads and caches the graph itself (~1.5GB). Just make sure `ogb` is
+installed (in the pip command above) and that `data/ogbn_mag` is writable.
+
+**`ieee_fraud`** — this one needs a manual pull, since it's a gated Kaggle competition and there's
+no anonymous download:
+
+```bash
+# one-time setup
+# 1. accept the competition rules (required before the API will serve the data):
+#    https://www.kaggle.com/competitions/ieee-fraud-detection/rules
+# 2. create an API token at https://www.kaggle.com/settings -> API -> Create New Token,
+#    which downloads kaggle.json -- move it to ~/.kaggle/kaggle.json
+
+mkdir -p data/ieee_fraud
+kaggle competitions download -c ieee-fraud-detection -f train_transaction.csv -p data/ieee_fraud
+kaggle competitions download -c ieee-fraud-detection -f train_identity.csv -p data/ieee_fraud
+cd data/ieee_fraud && unzip -o train_transaction.csv.zip && unzip -o train_identity.csv.zip && cd -
+```
+
+Only the labeled training files are needed (`isFraud` isn't published for the Kaggle test
+split, so it can't be used for eval here). Once the two CSVs are in `data/ieee_fraud/`, either
+run `python build_ieee_fraud_graph.py` directly to build and cache the graph, or just run
+`python train.py --dataset ieee_fraud` -- `datasets.py` builds and caches it (to
+`.cache/ieee_fraud_graph.pt`) automatically the first time it's needed.
 
 **Multi-seed evaluation was dropped in this refactor.** With 49 positives in the
 TigerGraph/synthetic graph, a single seed's ~7 test positives are not enough to trust one
