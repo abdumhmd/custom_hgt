@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .venv/
 lightning_logs/
+.DS_Store
