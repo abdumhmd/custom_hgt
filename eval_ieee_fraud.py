@@ -8,31 +8,32 @@ them directly, while `HGTConv` structurally cannot and only sees them via
 `transaction`'s own node features (the same amount/time info, reached the
 same way `data.reify_transfers` reaches it in the main fraud pipeline).
 
+Built on `lightning_module.py` rather than a hand-rolled loop: this task is
+binary, class-weighted, AUROC/AP-scored, full-graph -- exactly what
+`FraudHGTLightningModule` + `FraudFullGraphDataModule` already implement for
+the TigerGraph schema, with no fraud-schema coupling beyond an overridable
+`target_node_type` default. Mirrors `train.py`'s structure for the same
+reason: consistency with the rest of the repo, checkpointing/logging for
+free.
+
 Full-batch (graph is ~608K nodes / ~3.8M edges after ToUndirected -- small
 enough that a NeighborLoader isn't needed, unlike OGBN-MAG).
 """
 
 import argparse
 
+import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 import torch_geometric
 import torch_geometric.transforms as T
-import torchmetrics
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
-from model import build_model
+from features import build_edge_feat_dims, build_node_feat_dims
+from lightning_module import FraudFullGraphDataModule, FraudHGTLightningModule
 
 # See eval_ogbn_mag.py: forces PyG's plain per-type matmul loop instead of
 # pyg_lib's segment_matmul, which has no MPS kernel.
 torch_geometric.backend.use_segment_matmul = False
-
-
-def get_device():
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
 
 
 def load_data(cache_path):
@@ -40,57 +41,51 @@ def load_data(cache_path):
     return T.ToUndirected()(data)
 
 
-@torch.no_grad()
-def evaluate(model, data, mask):
-    model.eval()
-    out = model(data.x_dict, data.edge_index_dict, data.edge_attr_dict)
-    # torchmetrics' ROC/AP kernels are unreliable on MPS (observed: garbage
-    # indices, out-of-bounds crashes) -- compute metrics on CPU.
-    probs = out.softmax(dim=-1)[:, 1][mask].cpu()
-    y = data["transaction"].y[mask].cpu()
-    auroc = torchmetrics.functional.auroc(probs, y, task="binary").item()
-    ap = torchmetrics.functional.average_precision(probs, y, task="binary").item()
-    return auroc, ap
+def run_one(conv, data, args):
+    node_feat_dims = build_node_feat_dims(data)
+    edge_feat_dims = build_edge_feat_dims(data)
 
+    y_train = data["transaction"].y[data["transaction"].train_mask]
+    n_pos = (y_train == 1).sum().item()
+    n_neg = (y_train == 0).sum().item()
+    pos_weight = min(n_neg / max(n_pos, 1), 20.0)
+    class_weights = torch.tensor([1.0, pos_weight])
+    print(f"[{conv}] train fraud prevalence: {n_pos}/{n_pos + n_neg} -> pos_weight={pos_weight:.2f}")
 
-def train_one(conv, data, device, args):
-    node_feat_dims = {nt: data[nt].x.size(-1) for nt in data.node_types}
-    edge_feat_dims = {et: data[et].edge_attr.size(-1) for et in data.edge_types if "edge_attr" in data[et]}
-
-    model = build_model(
-        conv=conv,
+    module = FraudHGTLightningModule(
         node_feat_dims=node_feat_dims,
         metadata=data.metadata(),
-        edge_feat_dims=edge_feat_dims,
         hidden_channels=args.hidden_channels,
-        out_channels=2,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
+        lr=args.lr,
         target_node_type="transaction",
-        dropout=0.2,
-    ).to(device)
+        class_weights=class_weights,
+        conv=conv,
+        edge_feat_dims=edge_feat_dims,
+    )
 
-    y = data["transaction"].y
-    train_mask = data["transaction"].train_mask
-    class_counts = torch.bincount(y[train_mask], minlength=2).float()
-    class_weight = (class_counts.sum() / (2 * class_counts)).to(device)
+    dm = FraudFullGraphDataModule(data, target_node_type="transaction")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
+    callbacks = [
+        EarlyStopping(monitor="val_auroc", mode="max", patience=8),
+        ModelCheckpoint(monitor="val_auroc", mode="max", filename=f"ieee-{conv}-{{epoch}}-{{val_auroc:.3f}}"),
+    ]
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        optimizer.zero_grad()
-        out = model(data.x_dict, data.edge_index_dict, data.edge_attr_dict)
-        loss = F.cross_entropy(out[train_mask], y[train_mask], weight=class_weight)
-        loss.backward()
-        optimizer.step()
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        # torchmetrics' binary ROC/AP kernels produce garbage/crash on MPS
+        # (cumsum-based ops); CPU is the safe default for this script. Model
+        # forward/backward is cheap enough here that this costs little.
+        accelerator=args.accelerator,
+        callbacks=callbacks,
+        log_every_n_steps=1,
+        enable_progress_bar=True,
+    )
 
-        val_auroc, val_ap = evaluate(model, data, data["transaction"].val_mask)
-        print(f"  [{conv}] epoch {epoch}/{args.epochs}  loss={loss.item():.4f}  "
-              f"val_auroc={val_auroc:.4f}  val_ap={val_ap:.4f}")
-
-    test_auroc, test_ap = evaluate(model, data, data["transaction"].test_mask)
-    return {"conv": conv, "test_auroc": test_auroc, "test_ap": test_ap}
+    trainer.fit(module, datamodule=dm)
+    (test_metrics,) = trainer.test(module, datamodule=dm, ckpt_path="best")
+    return {"conv": conv, "test_auroc": test_metrics["test_auroc"], "test_ap": test_metrics["test_ap"]}
 
 
 def main():
@@ -101,23 +96,20 @@ def main():
     p.add_argument("--hidden-channels", type=int, default=64)
     p.add_argument("--num-heads", type=int, default=4)
     p.add_argument("--num-layers", type=int, default=2)
+    p.add_argument("--lr", type=float, default=0.005)
+    p.add_argument("--accelerator", default="cpu")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
-    torch.manual_seed(args.seed)
-    device = get_device()
-    print(f"device: {device}")
+    pl.seed_everything(args.seed, workers=True)
 
-    data = load_data(args.cache).to(device)
+    data = load_data(args.cache)
     print(data)
     base_rate = data["transaction"].y[data["transaction"].test_mask].float().mean().item()
     print(f"test fraud base rate: {base_rate:.4f}")
 
     convs = ["hgt", "transformer"] if args.conv == "both" else [args.conv]
-    results = []
-    for conv in convs:
-        print(f"\n=== {conv} ===")
-        results.append(train_one(conv, data, device, args))
+    results = [run_one(conv, data, args) for conv in convs]
 
     print("\n=== summary ===")
     for r in results:
